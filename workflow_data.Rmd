@@ -185,42 +185,44 @@ model <- glm(count ~
 
 summary(model)
 ```
-## Adding NDVI Data (Yearly)
+
+## Adding Environmental Data
 ```{r}
-ndvi_stack <- rast("ndvi_2017_2022_stack1608.tif")
-
-ndvi_df <- exact_extract(ndvi_stack, grid, 'mean')
-
-ndvi_df <- cbind(st_drop_geometry(grid), ndvi_df)
-ndvi_long <- ndvi_df %>%
-  pivot_longer(
-    cols = matches("^mean\\.[0-9]+_\\d{4}$"),  # match "mean.0_2017", etc.
-    names_to = "temp_year",
-    values_to = "ndvi"
-  ) %>%
-  mutate(year = as.integer(sub(".*_", "", temp_year))) %>%
-  select(-temp_year)
-
-grid_with_ndvi <- grid_fire_map %>%
-  left_join(ndvi_long, by = c("cell_id", "year"))
-grid_with_ndvi_clean <- grid_with_ndvi %>%
-  rename(
-    ADM1_grid = ADM1_NAME.x,
-    ADM2_grid = ADM2_NAME.x,
-    ADM1_ndvi = ADM1_NAME.y,
-    ADM2_ndvi = ADM2_NAME.y
+env_data <- read_csv("/Users/cameronsterling/Downloads/ML_FinalProject/SyriaGrid_EnvVars_Monthly_1428.csv")
+env_data <- read_csv("/Users/cameronsterling/Downloads/ML_FinalProject/SyriaGrid_EnvVars_Monthly_1428.csv") %>%
+  select(cell_id, year, month, NDVI, precip) %>%
+  mutate(
+    cell_id = as.character(cell_id),
+    year = as.integer(year),
+    month = as.integer(month)
   )
-```
 
-## Exporting
-```{r}
+grid_acled_wide <- grid_acled_wide %>%
+  mutate(
+    cell_id = as.character(cell_id),
+    year = as.integer(year),
+    month = as.integer(month)
+  )
 
-grid_acled_wide_trimmed_df <- grid_acled_wide_trimmed %>% st_drop_geometry()
+grid_acled_env <- left_join(grid_acled_wide, env_data, by = c("cell_id", "year", "month"))  %>%
+  mutate(across(
+    c(
+      "Non-state actor overtakes territory",
+      "Shelling/artillery/missile attack",
+      "Attack",
+      "Abduction/forced disappearance",
+      "Air/drone strike",
+      "Armed clash",
+      "Chemical weapon",
+      "Looting/property destruction",
+      "Remote explosive/landmine/IED",
+      "Suicide bomb",
+      "Other",
+      "Government regains territory"
+    ),
+    ~ replace_na(., 0)
+  ))
 
-grid_combined <- grid_with_ndvi_clean %>%
-  left_join(grid_acled_wide_trimmed_df, by = c("cell_id", "year", "month"))
-
-
-st_write(grid_combined, "grid_combined_output.gpkg", delete_dsn = TRUE)
+st_write(grid_acled_env, "grid_acled_env.shp", delete_dsn = TRUE)
 
 ```
