@@ -1,0 +1,73 @@
+
+// Here is how I created my Project's Geometry in Javascript in Google Earth Engine
+// === STEP 1: Load Admin Boundaries and Filter Northern Governorates ===
+var gaul1 = ee.FeatureCollection('FAO/GAUL/2015/level1');
+
+// Northern Syrian governorates
+var northSyria = gaul1.filter(ee.Filter.and(
+  ee.Filter.eq('ADM0_NAME', 'Syrian Arab Republic'),
+  ee.Filter.or(
+    ee.Filter.eq('ADM1_NAME', 'Aleppo'),
+    ee.Filter.eq('ADM1_NAME', 'Hassakeh'),
+    ee.Filter.eq('ADM1_NAME', 'Raqqa'),
+    ee.Filter.eq('ADM1_NAME', 'Idleb'),
+    ee.Filter.eq('ADM1_NAME', 'Dayr_Az_Zor') // optional: eastern part
+  )
+));
+
+// Merge into single geometry
+var region = northSyria.union().geometry();
+Map.centerObject(region, 7);
+// === STEP 2: Create Dummy Image with One Band ===
+var gridSize = 0.045; // ~5 km in degrees (approximate at mid-latitudes)
+
+// Create lat/lon bands and bin them
+var latlon = ee.Image.pixelLonLat();
+var lonGrid = latlon.select('longitude').divide(gridSize).floor();
+var latGrid = latlon.select('latitude').divide(gridSize).floor();
+
+var binImage = lonGrid.multiply(1e5).add(latGrid).toInt64(); // unique ID per cell
+binImage = binImage.clip(region);
+
+// === STEP 3: Convert to Polygons ===
+var gridVectors = binImage.reduceToVectors({
+  geometry: region,
+  geometryType: 'polygon',
+  scale: 5000,
+  maxPixels: 1e13,
+  bestEffort: true,
+  reducer: ee.Reducer.countEvery()
+});
+
+// === STEP 4: Add cell_id from centroid
+var gridWithId = gridVectors.map(function(f) {
+  var coords = f.geometry().centroid(10).coordinates();
+  var lon = ee.Number(coords.get(0)).format('%.4f');
+  var lat = ee.Number(coords.get(1)).format('%.4f');
+  var id = lon.cat('_').cat(lat);
+  return f.set('cell_id', id);
+});
+
+// === STEP 5: Add ADM1/ADM2 info
+var adm1 = ee.FeatureCollection('FAO/GAUL/2015/level1')
+  .filter(ee.Filter.eq('ADM0_NAME', 'Syrian Arab Republic'));
+var adm2 = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.eq('ADM0_NAME', 'Syrian Arab Republic'));
+
+var addAdminInfo = function(feature) {
+  var cellGeom = feature.geometry();
+  var adm1Name = adm1.filterBounds(cellGeom).first().get('ADM1_NAME');
+  var adm2Name = adm2.filterBounds(cellGeom).first().get('ADM2_NAME');
+  return feature.set({'ADM1_NAME': adm1Name, 'ADM2_NAME': adm2Name});
+};
+
+var enrichedGrid = gridWithId.map(addAdminInfo);
+
+// === STEP 6: Display and Export
+Map.addLayer(enrichedGrid, {color: 'blue'}, 'Final Grid (5km w/ Admin Info)');
+
+Export.table.toDrive({
+  collection: enrichedGrid,
+  description: 'Northern_Syria_5km_Grid_Final',
+  fileFormat: 'GeoJSON'
+});
