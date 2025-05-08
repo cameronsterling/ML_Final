@@ -1,0 +1,232 @@
+---
+title: "Final Project Workflow"
+author: "Cameron"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+### Setup
+```{r}
+library(sf)
+library(jsonlite)
+library(purrr)
+library(dplyr)
+library(dbscan)
+library(tidyverse)
+library(scales)
+
+
+
+# Loading the data
+acled <- read_csv("ACLED.csv")
+```
+### Geographic Filter
+```{r}
+northern_governorates <- c("Aleppo", "Al-Hasakeh", "Ar-Raqqa", "Idlib", "Deir-ez-Zor")
+
+acled <- acled %>%
+  mutate(
+    event_date = as.Date(event_date, format = "%d %B %Y"),
+    year = format(event_date, "%Y"),
+    month = format(event_date, "%m")
+  )
+
+
+filtered_acled <- acled %>%
+  filter(admin1 %in% northern_governorates) 
+
+
+filtered_acled <- filtered_acled %>%
+  mutate(
+    event_date = lubridate::ymd(event_date),
+    year = lubridate::year(event_date),
+    month = lubridate::month(event_date)
+  )
+
+filtered_acled <- filtered_acled %>%
+  select(-event_id_cnty, -source, -timestamp, -time_precision,    -disorder_type, -country, -region, -source, -source_scale, -tags, -timestamp)
+```
+
+### Loading my VIIRs data
+```{r}
+grid<- st_read("~/Downloads/ML_FinalProject/Northern_Syria_5km_Grid_Final.geojson")%>%  st_transform(4326) %>%
+  mutate(cell_id = paste0(
+    round(st_coordinates(st_centroid(geometry))[,1], 4), "_",
+    round(st_coordinates(st_centroid(geometry))[,2], 4)
+  )) %>% select(-count)
+
+
+fires <- st_read("/ML_FinalProject/VIIRS_1/fire_archive_SV-C2_610995.shp") %>%
+  st_transform(crs = st_crs(grid)) %>%
+  mutate(
+    ACQ_DATE = ymd(ACQ_DATE),
+    year = year(ACQ_DATE),
+    month = month(ACQ_DATE)
+  ) %>%
+  select(geometry, year, month)
+
+
+```
+
+
+
+## Putting VIIRS data into the Grid that I made in Javascript 
+```{r}
+fires_with_grid <- st_join(fires, grid, left = FALSE)
+
+fire_counts <- fires_with_grid %>%
+  st_drop_geometry() %>%
+  count(cell_id, year, month, name = "count")
+
+grid_meta <- grid %>% st_drop_geometry() %>% select(cell_id)
+year_months <- fire_counts %>% distinct(year, month)
+grid_cross <- expand_grid(grid_meta, year_months)
+
+grid_fire_map <- grid_cross %>%
+  left_join(fire_counts, by = c("cell_id", "year", "month")) %>%
+  mutate(count = replace_na(count, 0)) %>%
+  left_join(grid, by = "cell_id") %>%
+  st_as_sf()
+
+```
+
+```{r}
+summary(as.numeric(grid_fire_map$count))
+
+```
+
+### Joining ACLD Data with Fires and Grid Data
+```{r}
+grid_fire_map <- grid_fire_map %>%
+  filter(year >= 2017)
+
+sf_use_s2(FALSE)
+grid_polygons <- grid_fire_map %>%
+  group_by(cell_id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(cell_id, geometry)
+
+filtered_acled_sf <- st_as_sf(filtered_acled, coords = c("longitude", "latitude"), crs = 4326)
+
+
+
+acled_with_grid <- st_join(filtered_acled_sf, grid_polygons, join = st_within, left = FALSE)
+
+acled_with_grid <- acled_with_grid %>%
+  mutate(
+    event_date = ymd(event_date),
+    year = year(event_date),
+    month = month(event_date)
+  )
+
+acled_counts <- acled_with_grid %>%
+  st_drop_geometry() %>%
+  group_by(cell_id, year, month, sub_event_type) %>%
+  summarise(acled_event_count = n(), .groups = "drop")
+
+acled_wide <- acled_counts %>%
+  pivot_wider(
+    names_from = sub_event_type,
+    values_from = acled_event_count,
+    values_fill = 0
+  )
+
+acled_wide <- acled_wide %>%
+  mutate(
+    year = as.integer(year),
+    month = as.integer(month)
+  )
+
+grid_fire_map <- grid_fire_map %>%
+  mutate(
+    year = as.integer(year),
+    month = as.integer(month)
+  )
+
+
+grid_acled_wide <- left_join(grid_fire_map, acled_wide, by = c("cell_id", "year", "month")) %>% st_as_sf
+
+
+```
+
+
+
+## "Dumb Approach"
+```{r}
+df <- grid_acled_wide %>%
+  st_drop_geometry() %>%
+  filter(!is.na(count)) %>%
+  select(
+    count,
+    `Non-state actor overtakes territory`,
+    `Shelling/artillery/missile attack`,
+    `Attack`,
+    `Abduction/forced disappearance`,
+    `Air/drone strike`,
+    `Armed clash`,
+    `Chemical weapon`,
+    `Looting/property destruction`,
+    `Remote explosive/landmine/IED`,
+    `Suicide bomb`,
+    `Other`,
+    `Government regains territory`
+  )
+
+model <- glm(count ~ 
+               `Non-state actor overtakes territory` +
+               `Shelling/artillery/missile attack` +
+               `Attack` +
+               `Abduction/forced disappearance` +
+               `Air/drone strike` +
+               `Armed clash` +
+               `Chemical weapon` +
+               `Looting/property destruction` +
+               `Remote explosive/landmine/IED` +
+               `Suicide bomb` +
+               `Other` +
+               `Government regains territory`,
+             data = df,
+             family = "poisson")
+
+summary(model)
+```
+## Adding NDVI Data (Yearly)
+```{r}
+ndvi_stack <- rast("ndvi_2017_2022_stack1608.tif")
+
+ndvi_df <- exact_extract(ndvi_stack, grid, 'mean')
+
+ndvi_df <- cbind(st_drop_geometry(grid), ndvi_df)
+ndvi_long <- ndvi_df %>%
+  pivot_longer(
+    cols = matches("^mean\\.[0-9]+_\\d{4}$"),  # match "mean.0_2017", etc.
+    names_to = "temp_year",
+    values_to = "ndvi"
+  ) %>%
+  mutate(year = as.integer(sub(".*_", "", temp_year))) %>%
+  select(-temp_year)
+
+grid_with_ndvi <- grid_fire_map %>%
+  left_join(ndvi_long, by = c("cell_id", "year"))
+grid_with_ndvi_clean <- grid_with_ndvi %>%
+  rename(
+    ADM1_grid = ADM1_NAME.x,
+    ADM2_grid = ADM2_NAME.x,
+    ADM1_ndvi = ADM1_NAME.y,
+    ADM2_ndvi = ADM2_NAME.y
+  )
+```
+
+## Exporting
+```{r}
+
+grid_acled_wide_trimmed_df <- grid_acled_wide_trimmed %>% st_drop_geometry()
+
+grid_combined <- grid_with_ndvi_clean %>%
+  left_join(grid_acled_wide_trimmed_df, by = c("cell_id", "year", "month"))
+
+
+st_write(grid_combined, "grid_combined_output.gpkg", delete_dsn = TRUE)
+
+```
