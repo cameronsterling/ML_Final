@@ -1,0 +1,242 @@
+---
+title: "ML_Workflow"
+author: "Cameron Sterling"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(sf)
+library(jsonlite)
+library(purrr)
+library(dplyr)
+library(dbscan)
+library(tidyverse)
+library(VIM)
+library(isotree)
+
+library(scales)
+setwd("/Users/cameronsterling/Downloads/ML_FinalProject")
+df <- st_read("grid_acled_env.shp")
+```
+
+## Fitting Isolation Forest Model
+```{r}
+df$month_sin <- sin(2 * pi * df$month / 12)
+df$month_cos <- cos(2 * pi * df$month / 12)
+
+df$centroid <- st_centroid(df$geometry)
+coords <- st_coordinates(df$centroid)
+df$lon <- coords[, 1]
+df$lat <- coords[, 2]
+
+features <- df %>%
+  st_drop_geometry() %>%
+  select(count)
+
+features_clean <- features %>%
+  filter_all(all_vars(is.finite(.)))
+
+library(isotree)
+
+iso_model <- isolation.forest(features_clean, ntrees = 100)
+
+anomaly_scores <- predict(iso_model, features_clean, type = "score")
+
+df$anomaly_score <- NA
+df$anomaly_score[as.numeric(rownames(features_clean))] <- anomaly_scores
+
+threshold <- quantile(df$anomaly_score, 0.95, na.rm = TRUE)
+df$is_anomaly <- ifelse(df$anomaly_score > threshold, 1, 0)
+
+
+```
+
+
+
+```{r}
+ggplot(df, aes(x = lon, y = lat, color = factor(is_anomaly))) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = c("grey", "red")) +
+  labs(color = "Anomaly", title = "Anomalous Fire Events") +
+  theme_minimal()
+
+```
+```{r}
+
+
+df_anom_2020 <- df %>%
+  filter(is_anomaly == TRUE, year == 2020)
+
+ggplot(df_anom_2020) +
+  geom_sf(aes(color = anomaly_score), size = 1) +
+  scale_color_viridis_c(option = "blue") +
+  labs(title = "Anomalous Fire Events in 2020",
+       color = "Anomaly Score") +
+  theme_minimal()
+
+```
+
+## Clustering Based on Anomolies
+```{r}
+
+impute_vars <- df %>%
+  filter(is_anomaly == 1) %>%
+  st_drop_geometry() %>%
+  select(NDVI, precip, month_sin, lon, lat, year)
+imputed_data <- kNN(impute_vars, k = 10, imp_var = FALSE)
+```
+````{r}
+df_anom <- df %>%
+  filter(is_anomaly == 1) %>%
+  st_drop_geometry()
+
+df_anom$NDVI <- imputed_data$NDVI
+df_anom$precip <- imputed_data$precip
+
+```
+```{r}
+
+valid_rows <- df_anom %>%
+  select(month_sin, NDVI, precip, lon, lat, Nn.saot, Shll..a, Attack,
+         Ar.drns, Armdcls, Re..IED) %>%
+  apply(1, function(x) all(is.finite(x)))
+
+cluster_features <- df_anom[valid_rows, ] %>%
+  select(month_sin, NDVI, precip, lon, lat, Nn.saot, Shll..a, Attack,
+         Ar.drns, Armdcls, Re..IED) 
+library(dbscan)
+hdb <- hdbscan(cluster_features, minPts = 60)
+
+df_anom$cluster <- NA
+df_anom$cluster[which(valid_rows)] <- hdb$cluster
+```
+
+````{r}
+library(dbscan)
+
+results <- data.frame()
+
+for (minpts in seq(20, 200, by = 20)) {
+  model <- hdbscan(cluster_features, minPts = minpts)
+  
+  cluster_labels <- model$cluster
+  n_clusters <- length(unique(cluster_labels[cluster_labels != 0]))
+  n_noise <- sum(cluster_labels == 0)
+  
+  results <- rbind(results, data.frame(minPts = minpts,
+                                       n_clusters = n_clusters,
+                                       n_noise = n_noise))
+}
+```
+
+```{r}
+library(ggplot2)
+ggplot(results, aes(x = minPts)) +
+  geom_line(aes(y = (log(n_noise)), color = "red")) +
+  labs(title = "Tuning HDBSCAN minPts- How much noise?",
+       y = "Count",
+       caption = "Blue = # clusters, Red = # noise points") +
+  theme_minimal()
+
+library(ggplot2)
+ggplot(results, aes(x = minPts)) +
+  geom_line(aes(y = n_clusters), color = "blue") +
+  labs(title = "Tuning HDBSCAN minPts - Optimal # Clusters",
+       y = "Count",
+       caption = "Blue = # clusters, Red = # noise points") +
+  theme_minimal()
+
+
+
+
+```
+
+
+## Evaluating the clusters
+```{r}
+df_anom %>%
+  group_by(cluster) %>%
+  summarise(
+    count = n(),
+    mean_attack = mean(Attack, na.rm = TRUE),
+    mean_shelling = mean(Shll..a, na.rm = TRUE),
+    mean_airstrike = mean(Ar.drns, na.rm = TRUE),
+    mean_ndvi = mean(NDVI, na.rm = TRUE),
+    mean_precip = mean(precip, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+## Quantitive Score for Clusters
+```{r}
+library(cluster)
+
+clustered_rows <- hdb$cluster != 0
+clustered_features <- cluster_features[clustered_rows, ]
+cluster_labels <- hdb$cluster[clustered_rows]
+
+sil <- silhouette(cluster_labels, dist(clustered_features))
+mean_sil <- mean(sil[, 3])
+mean_sil
+```
+> 0.5 = strong clustering 
+
+## Compare to a baseline
+```{r}
+
+conflict_vars <- c("Nn.saot", "Shll..a", "Attack", "Abdct.d", "Ar.drns",  
+                   "Armdcls", "Ltng.pd", "Re..IED", "Sucdbmb", "Gvrnmrt")
+
+df_anom$rule_based_cluster <- ifelse(
+  rowSums(df_anom[, conflict_vars], na.rm = TRUE) > 0,
+  "Conflict", "Other"
+)
+
+df_anom %>%
+  group_by(rule_based_cluster) %>%
+  summarise(
+    count = n(),
+    avg_ndvi = mean(NDVI, na.rm = TRUE),
+    avg_precip = mean(precip, na.rm = TRUE),
+    avg_fire_count = mean(count, na.rm = TRUE),
+     mean_attack = mean(Attack, na.rm = TRUE),
+    mean_shelling = mean(Shll..a, na.rm = TRUE),
+    mean_airstrike = mean(Ar.drns, na.rm = TRUE),    .groups = "drop"
+  )
+
+
+
+```
+## Vislaizing How the Model Works 
+```{r}
+library(ggplot2)
+
+ggplot(df_anom, aes(x = lon, y = lat, color = factor(cluster))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_brewer(palette = "Set1", na.value = "grey") +
+  theme_minimal() +
+  labs(title = "Clustered and Noise Anomalies", x = "Longitude", y = "Latitude", color = "Cluster")
+
+
+```
+
+```{r}
+ggplot(df_anom %>% filter(!is.na(cluster)), aes(x = factor(month), fill = factor(cluster))) +
+  geom_bar(position = "dodge") +
+  theme_minimal() +
+  labs(title = "Anomaly Distribution by Month",
+       x = "Month", y = "Count", fill = "Cluster")
+
+
+```
+```{r}
+ggplot(df_anom %>% filter(!is.na(cluster)), aes(x = year, fill = factor(cluster))) +
+  geom_bar(position = "dodge") +
+  theme_minimal() +
+  labs(title = "Number of Anomalies per Year by Cluster",
+       x = "Year", y = "Count", fill = "Cluster")
+
+
+```
