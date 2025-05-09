@@ -1,4 +1,5 @@
-## Here is the Javascript code I used to get the NDVI 
+## Here is the Javascript code I used to get the NDVI  and precipitation
+// === STEP 1: Load Admin Boundaries and Filter Northern Governorates ===
 var gaul1 = ee.FeatureCollection('FAO/GAUL/2015/level1');
 var northSyria = gaul1.filter(ee.Filter.and(
   ee.Filter.eq('ADM0_NAME', 'Syrian Arab Republic'),
@@ -13,32 +14,101 @@ var northSyria = gaul1.filter(ee.Filter.and(
 var region = northSyria.union().geometry();
 Map.centerObject(region, 7);
 
-var years = ee.List.sequence(2017, 2022);
-var ndviYearly = years.map(function(y) {
-  y = ee.Number(y);  
-var yearStr = y.format('%d'); 
-  var start = ee.Date.fromYMD(y, 1, 1);
-  var end = start.advance(1, 'year');
+// === STEP 2: Create 5×5 km Grid ===
+var gridSize = 0.045;
+var latlon = ee.Image.pixelLonLat();
+var lonGrid = latlon.select('longitude').divide(gridSize).floor();
+var latGrid = latlon.select('latitude').divide(gridSize).floor();
+var binImage = lonGrid.multiply(1e5).add(latGrid).toInt64().clip(region);
 
-  var ndvi = ee.ImageCollection('MODIS/006/MOD13Q1')
-  .filterDate('2017-01-01', '2022-12-31')
-  .select('NDVI')
-  .map(function(img) {
-    return img.multiply(0.0001).copyProperties(img, ['system:time_start']);
-  });
-
-  return ndvi;
+var gridVectors = binImage.reduceToVectors({
+  geometry: region,
+  geometryType: 'polygon',
+  scale: 5000,
+  maxPixels: 1e13,
+  bestEffort: true,
+  reducer: ee.Reducer.countEvery()
 });
 
-var ndviStack = ee.ImageCollection(ndviYearly).toBands();
+var gridWithId = gridVectors.map(function(f) {
+  var coords = f.geometry().centroid(10).coordinates();
+  var lon = ee.Number(coords.get(0)).format('%.4f');
+  var lat = ee.Number(coords.get(1)).format('%.4f');
+  var id = lon.cat('_').cat(lat);
+  return f.set('cell_id', id);
+});
 
-Export.image.toDrive({
-  image: ndviStack,
-  description: 'NDVI_Stack_2017_2022',
-  folder: 'EarthEngineExports',
-  fileNamePrefix: 'ndvi_2017_2022_stack',
-  region: region,
-  scale: 250,
-  crs: 'EPSG:4326',
-  maxPixels: 1e13
+// === STEP 3: Add ADM1/ADM2 Info ===
+var adm1 = ee.FeatureCollection('FAO/GAUL/2015/level1')
+  .filter(ee.Filter.eq('ADM0_NAME', 'Syrian Arab Republic'));
+var adm2 = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.eq('ADM0_NAME', 'Syrian Arab Republic'));
+
+var addAdminInfo = function(feature) {
+  var cellGeom = feature.geometry();
+  var adm1Name = adm1.filterBounds(cellGeom).first().get('ADM1_NAME');
+  var adm2Name = adm2.filterBounds(cellGeom).first().get('ADM2_NAME');
+  return feature.set({'ADM1_NAME': adm1Name, 'ADM2_NAME': adm2Name});
+};
+
+var enrichedGrid = gridWithId.map(addAdminInfo);
+
+// === STEP 4: Load Land Cover Once (static, fast) ===
+var landcoverImage = ee.ImageCollection("MODIS/006/MCD12Q1")
+  .filterDate('2020-01-01', '2020-12-31')
+  .first()
+  .select('LC_Type1')
+  .rename('landcover')
+  .clip(region);
+
+// === STEP 5: Iterate by Month Using Fast MODIS NDVI + CHIRPS ===
+var start = ee.Date('2017-01-01');
+var end = ee.Date('2023-01-01');
+var months = ee.List.sequence(0, end.difference(start, 'month').subtract(1));
+
+var monthlyResults = months.map(function(m) {
+  var startMonth = start.advance(m, 'month');
+  var endMonth = startMonth.advance(1, 'month');
+
+  var ndvi = ee.ImageCollection("MODIS/061/MOD13A3")
+    .filterDate(startMonth, endMonth)
+    .select("NDVI")
+    .map(function(img) {
+      return img.multiply(0.0001).rename("NDVI");
+    })
+    .mean()
+    .clip(region);
+
+  var precip = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+    .filterDate(startMonth, endMonth)
+    .sum()
+    .rename("precip")
+    .clip(region);
+
+  var combined = ndvi.addBands(precip).addBands(landcoverImage);
+
+  var reduced = combined.reduceRegions({
+    collection: enrichedGrid,
+    reducer: ee.Reducer.mean(),
+    scale: 1000
+  }).map(function(f) {
+    return ee.Feature(null, f.toDictionary()).set({
+      'cell_id': f.get('cell_id'),
+      'year': startMonth.get('year'),
+      'month': startMonth.get('month'),
+      'ADM1_NAME': f.get('ADM1_NAME'),
+      'ADM2_NAME': f.get('ADM2_NAME')
+    });
+  });
+
+  return reduced;
+});
+
+// === STEP 6: Flatten + Export Without Geometry ===
+var allResults = ee.FeatureCollection(monthlyResults).flatten();
+
+Export.table.toDrive({
+  collection: allResults,
+  description: 'SyriaGrid_EnvVars_Monthly',
+  fileFormat: 'CSV'
 });
