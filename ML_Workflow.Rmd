@@ -1,10 +1,4 @@
----
-title: "ML_Workflow"
-author: "Cameron Sterling"
-date: "`r Sys.Date()`"
-output: pdf_document
----
-
+This is how I did my machine learning workflow and checking! 
 ```{r setup, include=FALSE}
 library(sf)
 library(jsonlite)
